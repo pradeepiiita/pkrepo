@@ -1,2 +1,1 @@
-# pkrepo
-repository
+# this is pkrepo
