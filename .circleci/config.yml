@@ -1,30 +1,127 @@
-# Use the latest 2.1 version of CircleCI pipeline process engine.
-# See: https://circleci.com/docs/configuration-reference
-version: 2.1
+name: run-tests
 
-# Orbs are reusable packages of CircleCI configuration that you may share across projects, enabling you to create encapsulated, parameterized commands, jobs, and executors that can be used across multiple projects.
-# See: https://circleci.com/docs/orb-intro/
-orbs:
-  ruby: circleci/ruby@2.0.1
+on:
+  push:
+    branches:
+      - main
+      - release/**
+  pull_request:
+  release:
+    types:
+      - created
 
-# Define a job to be invoked later in a workflow.
-# See: https://circleci.com/docs/configuration-reference/#jobs
 jobs:
-  build:
-    docker:
-      - image: cimg/ruby:3.1.0
-    executor: ruby/default
-    steps:
-      - checkout
-      - run:
-          name: Which bundler?
-          command: bundle -v
-      - ruby/install-deps
+  test:
+    runs-on: ubuntu-latest
+    env:
+      DB_HOST: "wes-tp-sql06.we.local"
+      DB_PORT: 1433
+      DB_DATABASE: "flywheel"
+      DB_USERNAME: "gas_plant"
+      DB_PASSWORD: "veggie_petroleum"
+      DB_SERVER: "wes-tp-sql06"
+      CONFIG_BASE: /srv/www/apps/revenue_accounting/config/settings.yml
+      RAILS_ENV: test
 
-# Orchestrate jobs using workflows
-# See: https://circleci.com/docs/configuration-reference/#workflows
-workflows:
-  sample: # This is the name of the workflow, feel free to change it to better match your workflow.
-    # Inside the workflow, you define the jobs you want to run.
-    jobs:
-      - build
+    services:
+      mssql:
+        image: mcr.microsoft.com/mssql/server:2019-latest
+        env:
+          ACCEPT_EULA: "Y"
+          SA_PASSWORD: "Waterfield123"
+        ports:
+          - "1433:1433"
+
+    steps:
+
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: 2.5.1
+          bundler-cache: true
+
+      - name: Check out code
+        uses: actions/checkout@v2
+        with:
+          fetch-depth: 0
+
+      - name: Move code to proper home
+        run: |
+          sudo chmod o+wx /srv /etc /home
+          mkdir -p /srv/www/apps
+          mkdir -p /home/wti
+          cp -r $GITHUB_WORKSPACE /srv/www/apps/revenue_accounting
+
+      - name: Install dependencies
+        run: |
+          curl https://packages.microsoft.com/keys/microsoft.asc | sudo apt-key add -
+          curl https://packages.microsoft.com/config/ubuntu/16.04/prod.list | sudo tee /etc/apt/sources.list.d/msprod.list
+          sudo apt-get update
+          sudo bash -c "ACCEPT_EULA=y apt-get install -y freetds-dev freetds-bin redis-server \
+            libtokyocabinet-dev ruby-tokyocabinet checkinstall build-essential \
+            libtokyocabinet9 ruby-dev patch libbz2-dev mssql-tools unixodbc-dev"
+
+      - name: Create configs
+        working-directory: /srv/www/apps/revenue_accounting
+        run: |
+          cp config/database.test.yml config/database.yml
+          mkdir -p /etc/revenue_accounting
+          cp config/config.test.yml /etc/revenue_accounting/config.yml
+          sudo cp config/freetds.test.conf /etc/freetds.conf
+
+      - name: Install tokyocabinet
+        working-directory: /srv/www/apps/revenue_accounting
+        run: gem install tokyocabinet -v '1.29.1' --source 'https://rubygems.org/' -- --with_cflags="-I/usr/include" --with_ldflags="-L/usr/lib"
+
+      - name: Cache gems
+        uses: pat-s/always-upload-cache@v2
+        with:
+          path: /srv/www/apps/revenue_accounting/vendor/bundle
+          key: v1-gems-${{ hashFiles('Gemfile.lock') }}-${{ github.ref }}
+          restore-keys: |
+            v1-gems-${{ hashFiles('Gemfile.lock') }}-${{ github.ref }}
+            v1-gems-${{ hashFiles('Gemfile.lock') }}-
+            v1-gems-
+
+      - name: Bundle Install
+        working-directory: /srv/www/apps/revenue_accounting
+        run: |
+          APP_BUNDLER_VERSION=$(cat Gemfile.lock | tail -1 | tr -d " ")
+          if ! echo $(bundle version)  | grep -q $APP_BUNDLER_VERSION; then
+            echo "Installing bundler $APP_BUNDLER_VERSION"
+            gem install bundler:$APP_BUNDLER_VERSION
+          else
+            echo "bundler $APP_BUNDLER_VERSION is already installed."
+          fi
+          bundle config set --local deployment 'true'
+          bundle config set --local without 'postgresql mysql'
+          git config --global url."https://github.com/".insteadOf 'git@github.com:'
+          bundle check || bundle install
+
+      - name: Database setup
+        working-directory: /srv/www/apps/revenue_accounting
+        run: |
+          /opt/mssql-tools/bin/sqlcmd -H wes-tp-sql06.we.local -P 1433 -U gas_plant -P 'veggie_petroleum' -Q "create database test"
+          bundle exec rake db:schema:load --trace
+          bundle exec thor load_seed:all Waterfield admin admin@bar.com Waterfield true
+          bundle exec rake db:migrate --trace
+
+      - name: Run tests
+        working-directory: /srv/www/apps/revenue_accounting
+        run: bundle exec rspec spec/**/*_spec.rb --profile 10 --format RspecJunitFormatter --out results.xml --format progress
+
+      - name: Fix test file paths
+        working-directory: /srv/www/apps/revenue_accounting
+        run: sed -i 's+/srv/www/apps/revenue_accounting+/github/workspace+g' coverage/coverage.json
+        if: always()
+
+      - name: Copy results
+        working-directory: /srv/www/apps/revenue_accounting
+        run: cp -r results.xml coverage $GITHUB_WORKSPACE/
+        if: always()
+
+      - name: SonarCloud Scan
+        uses: SonarSource/sonarcloud-github-action@master
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+        if: always()
